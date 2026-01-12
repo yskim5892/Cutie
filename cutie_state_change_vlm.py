@@ -17,7 +17,6 @@ import json
 import time
 import base64
 import io
-import logging
 
 import numpy as np
 import torch
@@ -25,8 +24,6 @@ import torch
 import cv2  # used for contours, video IO
 
 from PIL import Image
-
-log = logging.getLogger(__name__)
 
 
 # -----------------------------
