@@ -26,15 +26,6 @@ from cutie_state_change_vlm import (
 )
 
 
-def _maybe_unwrap_indexed_frame(ti: int, frame_rgb):
-    """Be robust to iterators that yield either frame_rgb or (idx, frame_rgb)."""
-    if isinstance(frame_rgb, tuple) and len(frame_rgb) == 2:
-        idx, fr = frame_rgb
-        if isinstance(idx, (int, np.integer)):
-            return int(idx), fr
-    return ti, frame_rgb
-
-
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser()
@@ -123,7 +114,6 @@ def main():
         frame_iter = enumerate(iter_frames_from_video(args.video_path))
 
     for ti, frame_rgb in frame_iter:
-        ti, frame_rgb = _maybe_unwrap_indexed_frame(ti, frame_rgb)
         img_tensor = to_tensor(frame_rgb).to(args.device).float()
 
         if ti == 0:
