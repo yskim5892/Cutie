@@ -283,7 +283,20 @@ class OpenAIVLMAnnotator:
         return "You are a highly intelligent assistant that can analyze videos and images."
 
     @staticmethod
-    def user_prompt(obj1_id: int, obj2_id: int, start_frame: int, end_frame: int) -> str:
+    def user_prompt(obj1_id: int, obj2_id: Optional[int], start_frame: int, end_frame: int) -> str:
+        if obj2_id is None:
+            return (
+                f"We are tracking objects in a video.\n"
+                f"- Red contour: object {obj1_id}\n\n"
+                f"The first image is the last clear frame before object {obj1_id} becomes occluded.\n"
+                f"The second image is the first clear frame after the occlusion interval.\n"
+                f"The occlusion interval is frames [{start_frame}, {end_frame}] (inclusive).\n\n"
+                f"Task: identify what the red contour object is and infer what likely happened during the interval.\n"
+                f"Return ONLY valid JSON with keys:\n"
+                f'  "obj1_name": a short object name for the red contour object (e.g., "notepad", "mug"),\n'
+                f'  "description": a short sentence (<= 20 words) describing what happened to the object,\n'
+                f'  "action": a short verb phrase describing the event (e.g., "gets covered", "moves behind", "is removed").\n'
+            )
         return (
             f"We are tracking objects in a video.\n"
             f"- Red contour: object {obj1_id}\n"
@@ -365,6 +378,48 @@ class OpenAIVLMAnnotator:
                 time.sleep(self.sleep_between_retries)
         raise RuntimeError(f"OpenAI call failed after {self.max_retries} retries: {last_err}") from last_err
 
+    def describe_occlusion(
+        self,
+        *,
+        pre_image: np.ndarray,
+        post_image: np.ndarray,
+        pre_mask_obj1: np.ndarray,
+        post_mask_obj1: np.ndarray,
+        obj1_id: int,
+        start_frame: int,
+        end_frame: int,
+        image_detail: str = "low",
+    ) -> Tuple[str, dict]:
+        pre_vis = overlay_contours(pre_image, pre_mask_obj1)
+        post_vis = overlay_contours(post_image, post_mask_obj1)
+
+        content = [
+            text_payload(self.user_prompt(obj1_id, None, start_frame, end_frame)),
+            text_payload("Image 1 (pre-occlusion):"),
+            image_payload(pre_vis, detail=image_detail),
+            text_payload("Image 2 (post-occlusion):"),
+            image_payload(post_vis, detail=image_detail),
+        ]
+
+        last_err: Optional[Exception] = None
+        for _ in range(self.max_retries):
+            try:
+                rsp = self.client.chat.completions.create(
+                    model=self.model,
+                    temperature=self.temperature,
+                    messages=[
+                        {"role": "system", "content": self.system_prompt()},
+                        {"role": "user", "content": content},
+                    ],
+                )
+                text = rsp.choices[0].message.content
+                _, data = self._parse_json(text)
+                return text, data
+            except Exception as e:  # pragma: no cover
+                last_err = e
+                time.sleep(self.sleep_between_retries)
+        raise RuntimeError(f"OpenAI call failed after {self.max_retries} retries: {last_err}") from last_err
+
 
 # -----------------------------
 # Pipeline glue
@@ -374,7 +429,6 @@ class CutieStateChangePipeline:
         self,
         *,
         processor: Any,  # InferenceCore
-        obj1_id: int,
         vlm: Optional[OpenAIVLMAnnotator] = None,
         occlusion: Optional[OcclusionDetector] = None,
         selector: Optional[InteractionCandidateSelector] = None,
@@ -382,7 +436,6 @@ class CutieStateChangePipeline:
         save_mask_every: int = 1,
     ):
         self.processor = processor
-        self.obj1_id = int(obj1_id)
         self.vlm = vlm
         self.occlusion = occlusion or OcclusionDetector()
         self.selector = selector or InteractionCandidateSelector()
@@ -392,6 +445,19 @@ class CutieStateChangePipeline:
 
         self.images: List[np.ndarray] = []
         self.cls_masks: List[np.ndarray] = []
+        self._occlusion_detectors: dict[int, OcclusionDetector] = {}
+
+    def _ensure_detector(self, obj_id: int) -> OcclusionDetector:
+        if obj_id not in self._occlusion_detectors:
+            self._occlusion_detectors[obj_id] = OcclusionDetector(
+                visible_ratio_th=self.occlusion.visible_ratio_th,
+                min_area_px=self.occlusion.min_area_px,
+                ema_alpha=self.occlusion.ema_alpha,
+                start_patience=self.occlusion.start_patience,
+                end_patience=self.occlusion.end_patience,
+                warmup_frames=self.occlusion.warmup_frames,
+            )
+        return self._occlusion_detectors[obj_id]
 
     def _remap_tmp_to_obj(self, mask_tmp: np.ndarray) -> np.ndarray:
         om = getattr(self.processor, "object_manager", None)
@@ -436,11 +502,21 @@ class CutieStateChangePipeline:
         pred_cls_mask = self._remap_tmp_to_obj(mask_tmp)
 
         self.cls_masks.append(pred_cls_mask)
-        m1 = bin_mask_from_id(pred_cls_mask, self.obj1_id)
-        self.occlusion.update(frame_idx, m1, obj_id=self.obj1_id)
+        present_ids = {int(x) for x in np.unique(pred_cls_mask) if int(x) != 0}
+        all_ids = set(self._occlusion_detectors.keys()) | present_ids
+        empty_mask = np.zeros_like(pred_cls_mask, dtype=np.uint8)
+        for obj_id in sorted(all_ids):
+            det = self._ensure_detector(obj_id)
+            if obj_id in present_ids:
+                mask01 = bin_mask_from_id(pred_cls_mask, obj_id)
+            else:
+                mask01 = empty_mask
+            det.update(frame_idx, mask01, obj_id=obj_id)
 
     def pop_state_changes(self, *, image_detail: str = "low") -> List[StateChange]:
-        events = self.occlusion.pop_events()
+        events: List[OcclusionEvent] = []
+        for det in self._occlusion_detectors.values():
+            events.extend(det.pop_events())
         out: List[StateChange] = []
 
         if not events:
@@ -468,27 +544,51 @@ class CutieStateChangePipeline:
             post_img = self.images[ev.post_frame]
             pre_cls = self.cls_masks[ev.pre_frame]
             post_cls = self.cls_masks[ev.post_frame]
+            start_cls = self.cls_masks[ev.start_frame] if ev.start_frame < len(self.cls_masks) else pre_cls
 
-            other_ids = sorted({int(x) for x in np.unique(pre_cls) if int(x) not in (0, ev.obj_id)})
-            candidates = self.selector.select(pre_cls, ev.obj_id, other_ids)
+            pre_m1 = bin_mask_from_id(pre_cls, ev.obj_id)
+            post_m1 = bin_mask_from_id(post_cls, ev.obj_id)
+            start_m1 = bin_mask_from_id(start_cls, ev.obj_id)
+
+            disappeared = (pre_m1 > 0) & (start_m1 == 0)
+            occluder_ids = sorted({
+                int(x)
+                for x in np.unique(start_cls[disappeared])
+                if int(x) not in (0, ev.obj_id)
+            })
+            candidates = self.selector.select(start_cls, ev.obj_id, occluder_ids)
+            if not candidates and occluder_ids:
+                candidates = occluder_ids[: self.selector.top_k]
 
             if not candidates:
+                raw_text, parsed = self.vlm.describe_occlusion(
+                    pre_image=pre_img,
+                    post_image=post_img,
+                    pre_mask_obj1=pre_m1,
+                    post_mask_obj1=post_m1,
+                    obj1_id=ev.obj_id,
+                    start_frame=ev.start_frame,
+                    end_frame=ev.end_frame,
+                    image_detail=image_detail,
+                )
+
+                desc = parsed.get("description", raw_text)
+                obj1_name = parsed.get("obj1_name") or parsed.get("object_1") or parsed.get("obj1")
+                obj1_name = str(obj1_name).strip() if obj1_name else f"object {ev.obj_id}"
                 out.append(StateChange(
                     start_frame=ev.start_frame,
                     end_frame=ev.end_frame,
                     obj1_id=ev.obj_id,
                     obj2_id=-1,
-                    obj1=f"object {ev.obj_id}",
+                    obj1=obj1_name,
                     obj2="unknown object",
-                    description="occlusion (no nearby tracked obj2 found)",
-                    meta={"event": ev.__dict__}
+                    description=str(desc).strip(),
+                    meta={"vlm_raw": raw_text, "vlm_parsed": parsed, "event": ev.__dict__}
                 ))
                 continue
 
             for obj2 in candidates:
-                pre_m1 = bin_mask_from_id(pre_cls, ev.obj_id)
                 pre_m2 = bin_mask_from_id(pre_cls, obj2)
-                post_m1 = bin_mask_from_id(post_cls, ev.obj_id)
                 post_m2 = bin_mask_from_id(post_cls, obj2)
 
                 raw_text, parsed = self.vlm.describe_interaction(
