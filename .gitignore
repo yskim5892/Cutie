@@ -9,6 +9,9 @@ output
 pretrained/
 workspace
 workspace/
+examples/
+dataset/
+outputs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

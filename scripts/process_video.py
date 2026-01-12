@@ -1,4 +1,5 @@
 from os import path, listdir
+from pathlib import Path
 from omegaconf import DictConfig, open_dict
 from hydra import compose, initialize
 
@@ -7,6 +8,8 @@ import torch
 from cutie.model.cutie import CUTIE
 from cutie.inference.inference_core import InferenceCore
 from cutie.inference.utils.results_utils import ResultSaver
+from utils import rgb_to_p
+from pngs_to_mp4 import pngs_to_mp4
 
 from tqdm import tqdm
 
@@ -70,8 +73,8 @@ def process_video(cfg: DictConfig):
         use_long_id = False
         palette = first_mask.getpalette()
     elif first_mask.mode == 'RGB':
+        first_mask, palette, _ = rgb_to_p(first_mask)
         use_long_id = True
-        palette = None
     elif first_mask.mode == 'L':
         use_long_id = False
         palette = None
@@ -97,6 +100,9 @@ def process_video(cfg: DictConfig):
             pbar.set_description('Commiting masks into permenent memory')
             for mask_name in all_mask_frames:
                 mask = Image.open(path.join(mask_dir, mask_name))
+                if mask.mode == 'RGB':
+                    mask, _, _ = rgb_to_p(mask)
+
                 frame_number = int(mask_name[:-4])
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
 
@@ -158,6 +164,8 @@ def process_video(cfg: DictConfig):
                 mask_path = path.join(mask_dir, frame_name)
                 if path.exists(mask_path):
                     mask = Image.open(mask_path)
+                    if mask.mode == 'RGB':
+                        mask, _, _ = rgb_to_p(mask)
 
                 # convert numpy array to pytorch tensor format
                 frame_torch = image_to_torch(frame, device=device)
@@ -230,38 +238,12 @@ def check_to_clear_non_permanent_cuda_memory(processor: InferenceCore, device, m
 
 def get_arguments():
     parser = ArgumentParser()
-    parser.add_argument('-v', '--video', help='Video file.', default=None)
-    parser.add_argument(
-        '-m',
-        '--mask_dir',
-        help=
-        'Directory with mask files. Must be named with with corresponding video frame number syntax [07d].',
-        default=None)
-    parser.add_argument('-o',
-                        '--output_dir',
-                        help='Directory where processed mask files will be saved.',
-                        default=None)
-    parser.add_argument('-d',
-                        '--device',
-                        help='Target device for processing [cuda, cpu].',
-                        default='cuda')
-    parser.add_argument(
-        '--mem_every',
-        help='How often to update working memory; higher number speeds up processing.',
-        type=int,
-        default='10')
-    parser.add_argument(
-        '--max_internal_size',
-        help=
-        'maximum internal processing size; reducing this speeds up processing; -1 means no resizing.',
-        type=int,
-        default='480')
-    parser.add_argument(
-        '--mem_cleanup_ratio',
-        help=
-        'How often to clear non permanent GPU memory; when ratio of GPU memory used is above given mem_cleanup_ratio [0;1] then cleanup is triggered; only used when device=cuda.',
-        type=float,
-        default='-1')
+    p.add_argument("--name", type=str, required=False, help="Name of the data")
+    parser.add_argument('--output_mp4', help="Whether to save segment video or not", action='store_true')
+    parser.add_argument('-d', '--device', help='Target device for processing [cuda, cpu].', default='cuda')
+    parser.add_argument('--mem_every', help='How often to update working memory; higher number speeds up processing.', type=int, default='10')
+    parser.add_argument('--max_internal_size', help='maximum internal processing size; reducing this speeds up processing; -1 means no resizing.', type=int,default='480')
+    parser.add_argument('--mem_cleanup_ratio', help='How often to clear non permanent GPU memory; when ratio of GPU memory used is above given mem_cleanup_ratio [0;1] then cleanup is triggered; only used when device=cuda.', type=float, default='-1')
 
     args = parser.parse_args()
     return args
@@ -272,7 +254,7 @@ if __name__ == '__main__':
     args = get_arguments()
 
     # getting hydra's config without using its decorator
-    initialize(version_base='1.3.2', config_path="cutie/config", job_name="process_video")
+    initialize(version_base='1.3.2', config_path="../cutie/config", job_name="process_video")
     cfg = compose(config_name="video_config")
 
     # merge arguments into config
@@ -281,4 +263,11 @@ if __name__ == '__main__':
         for k, v in args.items():
             cfg[k] = v
 
+    pm = PathManager(cfg['name'])
+    cfg['video'] = pm.get_video_path()
+    cfg['mask_dir'] = pm.get_input_mask_dir()
+    cfg['output_dir'] = pm.get_output_mask_dir()
+
     process_video(cfg)
+    if cfg['output_mp4']:
+        pngs_to_mp4(cfg['output_dir'], pm.get_output_video_path(), 30) 

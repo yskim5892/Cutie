@@ -8,6 +8,8 @@ import numpy as np
 from cutie.inference.inference_core import InferenceCore
 from cutie.utils.get_default_model import get_default_model
 
+from utils import rgb_to_p
+
 
 @torch.inference_mode()
 @torch.cuda.amp.autocast()
@@ -29,7 +31,8 @@ def main():
     # and definitely NOT a colored RGB image
     # https://pillow.readthedocs.io/en/stable/handbook/concepts.html: mode "L" or "P"
     mask = Image.open('./examples/masks/bike/00000.png')
-    assert mask.mode in ['L', 'P']
+    if mask.mode == 'RGB':
+        mask, _, _ = rgb_to_p(mask)
 
     # palette is for visualization
     palette = mask.getpalette()

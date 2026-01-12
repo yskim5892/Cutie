@@ -27,7 +27,7 @@ max_mem_frames: 5
 # only relevant when long_term is enabled
 long_term:
   count_usage: True
-  max_mem_frames: 10
+  max_mem_frames: 50
   min_mem_frames: 5
   num_prototypes: 128
   max_num_tokens: 10000
