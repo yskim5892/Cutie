@@ -33,7 +33,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", type=str, required=True, help="Name of the data")
     parser.add_argument("--input_type", type=str, default="video", help="frames or video")
-    parser.add_argument("--obj1_id", type=int, required=True, help="Object ID to detect occlusion for.")
     parser.add_argument("--model", type=str, default="gpt-5.2", help="OpenAI VLM model name.")
     parser.add_argument("--temperature", type=float, default=0.0, help="VLM temperature (gpt-5.2 supports this).")
     parser.add_argument("--max_internal_size", type=int, default=480, help="Cutie internal resize; -1 keeps original.")
@@ -82,8 +81,6 @@ def main():
     mask_np = np.array(first_mask).astype(np.int64)
     objects = np.unique(mask_np)
     objects = objects[objects != 0].tolist()
-    if args.obj1_id not in objects:
-        raise ValueError(f"--obj1_id {args.obj1_id} not present in init_mask object IDs: {objects}")
 
     init_mask_tensor = torch.from_numpy(mask_np).to(args.device)
 
@@ -105,7 +102,6 @@ def main():
 
     pipe = CutieStateChangePipeline(
         processor=processor,
-        obj1_id=args.obj1_id,
         vlm=vlm,
         mask_saver=mask_saver,
     )
