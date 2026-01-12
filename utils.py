@@ -69,12 +69,25 @@ def rgb_to_p(mask: Image.Image, bg_rgb=(0, 0, 0), colors=3):
       K: number of objects
     """
     if mask.mode == "RGB":
-        mask = mask.convert(
-            "P",
-            palette=Image.Palette.ADAPTIVE,
-            colors=colors,
-            dither=Image.Dither.NONE
-        )
+        rgb = np.array(mask, dtype=np.uint8)
+        uniq = np.unique(rgb.reshape(-1, 3), axis=0)
+        bg = np.array(bg_rgb, dtype=np.int32)
+        d = np.sum((uniq.astype(np.int32) - bg) ** 2, axis=1)
+        bg_idx = int(np.argmin(d))
+        bg_color = uniq[bg_idx]
+
+        uniq_nonbg = [u for i, u in enumerate(uniq.tolist()) if i != bg_idx]
+        out = np.zeros(rgb.shape[:2], dtype=np.uint8)
+        for new_id, color in enumerate(uniq_nonbg, start=1):
+            color_arr = np.array(color, dtype=np.uint8)
+            out[np.all(rgb == color_arr, axis=-1)] = new_id
+
+        pal = [0] * (256 * 3)
+        pal[0:3] = bg_color.tolist()
+        for new_id, color in enumerate(uniq_nonbg, start=1):
+            pal[3 * new_id:3 * new_id + 3] = color
+
+        return out, pal, len(uniq_nonbg)
 
     if mask.mode == "P":
         pal = mask.getpalette()  # length 768 = 256*3
@@ -88,12 +101,18 @@ def rgb_to_p(mask: Image.Image, bg_rgb=(0, 0, 0), colors=3):
         d = np.sum((pal_rgb[uniq] - bg) ** 2, axis=1)
         bg_idx = int(uniq[int(np.argmin(d))])
 
-        # Remap bg_idx -> 0, others -> 1..K 
+        # Remap bg_idx -> 0, others -> 1..K
         uniq_nonbg = [u for u in uniq.tolist() if u != bg_idx]
         out = np.zeros_like(mask_np, dtype=np.uint8)
         for new_id, old_id in enumerate(uniq_nonbg, start=1):
             out[mask_np == old_id] = new_id
-        return out, pal, len(uniq_nonbg)
+
+        new_pal = [0] * (256 * 3)
+        new_pal[0:3] = pal_rgb[bg_idx].tolist()
+        for new_id, old_id in enumerate(uniq_nonbg, start=1):
+            new_pal[3 * new_id:3 * new_id + 3] = pal_rgb[old_id].tolist()
+
+        return out, new_pal, len(uniq_nonbg)
 
     elif mask.mode == "L":
         mask_np = np.array(mask, dtype=np.uint8)
@@ -107,4 +126,3 @@ def rgb_to_p(mask: Image.Image, bg_rgb=(0, 0, 0), colors=3):
 
     else:
         raise ValueError(f"Unsupported mask mode: {mask.mode}")
-
