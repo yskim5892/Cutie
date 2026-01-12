@@ -42,8 +42,10 @@ class OcclusionEvent:
 class StateChange:
     start_frame: int
     end_frame: int
-    obj1: int
-    obj2: int
+    obj1_id: int
+    obj2_id: int
+    obj1: str
+    obj2: str
     description: str
     meta: Optional[dict] = None
 
@@ -289,9 +291,11 @@ class OpenAIVLMAnnotator:
             f"The first image is the last clear frame before object {obj1_id} becomes occluded.\n"
             f"The second image is the first clear frame after the occlusion interval.\n"
             f"The occlusion interval is frames [{start_frame}, {end_frame}] (inclusive).\n\n"
-            f"Task: infer what likely happened between these two objects during the interval.\n"
+            f"Task: identify what each object is and infer what likely happened between them during the interval.\n"
             f"Return ONLY valid JSON with keys:\n"
-            f'  "description": a short sentence (<= 20 words) describing the interaction,\n'
+            f'  "obj1_name": a short object name for red contour object (e.g., "notepad", "mug"),\n'
+            f'  "obj2_name": a short object name for blue contour object,\n'
+            f'  "description": a short sentence (<= 20 words) describing the interaction, using the object names,\n'
             f'  "action": a short verb phrase describing the interaction (e.g., "covers", "moves behind", "picks up").\n'
         )
 
@@ -447,8 +451,10 @@ class CutieStateChangePipeline:
                 out.append(StateChange(
                     start_frame=ev.start_frame,
                     end_frame=ev.end_frame,
-                    obj1=ev.obj_id,
-                    obj2=-1,
+                    obj1_id=ev.obj_id,
+                    obj2_id=-1,
+                    obj1=f"object {ev.obj_id}",
+                    obj2="unknown object",
                     description="occluded",
                     meta={"note": "No VLM annotator configured."}
                 ))
@@ -470,8 +476,10 @@ class CutieStateChangePipeline:
                 out.append(StateChange(
                     start_frame=ev.start_frame,
                     end_frame=ev.end_frame,
-                    obj1=ev.obj_id,
-                    obj2=-1,
+                    obj1_id=ev.obj_id,
+                    obj2_id=-1,
+                    obj1=f"object {ev.obj_id}",
+                    obj2="unknown object",
                     description="occlusion (no nearby tracked obj2 found)",
                     meta={"event": ev.__dict__}
                 ))
@@ -498,11 +506,17 @@ class CutieStateChangePipeline:
                 )
 
                 desc = parsed.get("description", raw_text)
+                obj1_name = parsed.get("obj1_name") or parsed.get("object_1") or parsed.get("obj1")
+                obj2_name = parsed.get("obj2_name") or parsed.get("object_2") or parsed.get("obj2")
+                obj1_name = str(obj1_name).strip() if obj1_name else f"object {ev.obj_id}"
+                obj2_name = str(obj2_name).strip() if obj2_name else f"object {obj2}"
                 out.append(StateChange(
                     start_frame=ev.start_frame,
                     end_frame=ev.end_frame,
-                    obj1=ev.obj_id,
-                    obj2=obj2,
+                    obj1_id=ev.obj_id,
+                    obj2_id=obj2,
+                    obj1=obj1_name,
+                    obj2=obj2_name,
                     description=str(desc).strip(),
                     meta={"vlm_raw": raw_text, "vlm_parsed": parsed, "event": ev.__dict__}
                 ))
@@ -540,6 +554,8 @@ def save_state_changes_json(state_changes: List[StateChange], out_path: str) -> 
         {
             "start_frame": sc.start_frame,
             "end_frame": sc.end_frame,
+            "obj1_id": sc.obj1_id,
+            "obj2_id": sc.obj2_id,
             "obj1": sc.obj1,
             "obj2": sc.obj2,
             "description": sc.description,
