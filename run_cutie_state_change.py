@@ -5,11 +5,13 @@ import os
 import numpy as np
 import torch
 from PIL import Image
+from pathlib import Path
 from utils import rgb_to_p, PathManager
 from torchvision.transforms.functional import to_tensor
 
 from cutie.inference.inference_core import InferenceCore
 from cutie.utils.get_default_model import get_default_model
+from pngs_to_mp4 import pngs_to_mp4
 
 # Prefer Cutie's ResultSaver; fall back to local copy if present
 try:
@@ -35,6 +37,7 @@ def main():
     parser.add_argument("--model", type=str, default="gpt-5.2", help="OpenAI VLM model name.")
     parser.add_argument("--temperature", type=float, default=0.0, help="VLM temperature (gpt-5.2 supports this).")
     parser.add_argument("--max_internal_size", type=int, default=480, help="Cutie internal resize; -1 keeps original.")
+    parser.add_argument("--output_fps", type=float, default=30.0, help="FPS for output mask video.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     args = parser.parse_args()
@@ -45,6 +48,7 @@ def main():
     args.frames_dir = pm.get_frames_dir()
     args.mask_dir = pm.get_input_mask_dir()
     args.output_mask_dir = pm.get_output_mask_dir()
+    args.output_video_path = pm.get_output_video_path()
     args.out_json = pm.get_output_state_changes_path()
 
     # Load Cutie model
@@ -128,6 +132,7 @@ def main():
 
     if mask_saver is not None:
         mask_saver.end()
+        pngs_to_mp4(Path(args.output_mask_dir), Path(args.output_video_path), fps=args.output_fps)
 
 
 if __name__ == "__main__":
