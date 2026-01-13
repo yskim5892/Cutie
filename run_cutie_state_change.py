@@ -27,6 +27,11 @@ from cutie_state_change_vlm import (
     save_state_changes_json,
 )
 
+try:
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover
+    cv2 = None
+
 
 @torch.inference_mode()
 def main():
@@ -108,12 +113,24 @@ def main():
 
     # Iterate frames
     all_sc = []
+    total_frames = None
     if args.input_type == "frames":
         frame_iter = enumerate(iter_frames_from_dir(args.frames_dir))
+        frame_files = [
+            f
+            for f in os.listdir(args.frames_dir)
+            if os.path.splitext(f.lower())[1] in {".png", ".jpg", ".jpeg"}
+        ]
+        total_frames = len(frame_files)
     else:
         frame_iter = enumerate(iter_frames_from_video(args.video_path))
+        if cv2 is not None:
+            cap = cv2.VideoCapture(args.video_path)
+            if cap.isOpened():
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
+            cap.release()
 
-    for ti, frame_rgb in frame_iter:
+    for ti, frame_rgb in pipe.iter_with_progress(frame_iter, total=total_frames):
         img_tensor = to_tensor(frame_rgb).to(args.device).float()
 
         if ti == 0:
@@ -125,6 +142,12 @@ def main():
 
     save_state_changes_json(all_sc, args.out_json)
     print(f"[OK] wrote {len(all_sc)} state changes to {args.out_json}")
+    print(
+        "[Timing] Cutie inference: {:.2f}s | GPT API: {:.2f}s".format(
+            pipe.inference_seconds,
+            pipe.vlm_seconds,
+        )
+    )
 
     if mask_saver is not None:
         mask_saver.end()
