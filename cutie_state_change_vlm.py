@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Iterable, Any
+from collections import deque
 
 import os
 import json
@@ -36,6 +37,15 @@ class OcclusionEvent:
     end_frame: int    # last frame judged "occluded"
     pre_frame: int    # last visible frame before start_frame
     post_frame: int   # first visible frame after end_frame
+
+
+@dataclass
+class OffscreenEvent:
+    obj_id: int
+    start_frame: int  # first frame of near-border shrink
+    end_frame: int    # last visible frame before disappearing
+    pre_frame: int    # last visible frame before disappearance
+    post_frame: int   # first frame after disappearance
 
 
 @dataclass
@@ -177,6 +187,84 @@ class OcclusionDetector:
         return ev
 
 
+class OffscreenDetector:
+    def __init__(
+        self,
+        *,
+        min_area_px: int = 50,
+        border_margin_px: int = 10,
+        decrease_window: int = 3,
+        disappear_patience: int = 2,
+        min_border_hits: Optional[int] = None,
+    ):
+        self.min_area_px = int(min_area_px)
+        self.border_margin_px = int(border_margin_px)
+        self.decrease_window = int(decrease_window)
+        self.disappear_patience = int(disappear_patience)
+        self.min_border_hits = int(min_border_hits) if min_border_hits is not None else max(1, int(round(self.decrease_window * 0.6)))
+
+        self._history = deque(maxlen=self.decrease_window)
+        self._last_visible_frame: Optional[int] = None
+        self._not_visible_streak = 0
+        self._first_not_visible_frame: Optional[int] = None
+        self._offscreen = False
+        self._pending_events: List[OffscreenEvent] = []
+
+    def _near_border(self, bbox: Optional[Tuple[int, int, int, int]], W: int, H: int) -> bool:
+        if bbox is None:
+            return False
+        x1, y1, x2, y2 = bbox
+        margin = self.border_margin_px
+        return x1 <= margin or y1 <= margin or x2 >= (W - margin) or y2 >= (H - margin)
+
+    def update(self, frame_idx: int, mask01: np.ndarray, obj_id: int) -> None:
+        H, W = mask01.shape[:2]
+        area = mask_area(mask01)
+        visible = area >= self.min_area_px
+
+        if visible:
+            bbox = mask_bbox(mask01)
+            near_border = self._near_border(bbox, W, H)
+            self._history.append((frame_idx, area, near_border))
+            self._last_visible_frame = frame_idx
+            self._not_visible_streak = 0
+            self._first_not_visible_frame = None
+            self._offscreen = False
+            return
+
+        self._not_visible_streak += 1
+        if self._first_not_visible_frame is None:
+            self._first_not_visible_frame = frame_idx
+
+        if self._offscreen or self._not_visible_streak < self.disappear_patience:
+            return
+
+        if len(self._history) < self.decrease_window or self._last_visible_frame is None:
+            return
+
+        areas = [a for _, a, _ in self._history]
+        border_hits = sum(1 for _, _, near in self._history if near)
+        decreases = sum(1 for i in range(1, len(areas)) if areas[i] < areas[i - 1])
+
+        if decreases >= (self.decrease_window - 1) and border_hits >= self.min_border_hits:
+            start_frame = self._history[0][0]
+            end_frame = self._last_visible_frame
+            pre_frame = self._last_visible_frame
+            post_frame = int(self._first_not_visible_frame)
+            self._pending_events.append(OffscreenEvent(
+                obj_id=obj_id,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                pre_frame=pre_frame,
+                post_frame=post_frame,
+            ))
+            self._offscreen = True
+
+    def pop_events(self) -> List[OffscreenEvent]:
+        ev, self._pending_events = self._pending_events, []
+        return ev
+
+
 # -----------------------------
 # Candidate selection (obj2)
 # -----------------------------
@@ -312,6 +400,21 @@ class OpenAIVLMAnnotator:
             f'  "action": a short verb phrase describing the interaction (e.g., "covers", "moves behind", "picks up").\n'
         )
 
+    @staticmethod
+    def user_prompt_out_of_frame(obj1_id: int, start_frame: int, end_frame: int) -> str:
+        return (
+            f"We are tracking objects in a video.\n"
+            f"- Red contour: object {obj1_id}\n\n"
+            f"The first image is the last clear frame before object {obj1_id} starts leaving the frame.\n"
+            f"The second image is the first frame after the object disappears from the frame.\n"
+            f"The disappearance interval is frames [{start_frame}, {end_frame}] (inclusive).\n\n"
+            f"Task: identify what the red contour object is and describe it leaving the screen.\n"
+            f"Return ONLY valid JSON with keys:\n"
+            f'  "obj1_name": a short object name for the red contour object (e.g., "notepad", "mug"),\n'
+            f'  "description": a short sentence (<= 20 words) describing the object leaving the frame,\n'
+            f'  "action": a short verb phrase describing the event (e.g., "moves off-screen", "exits frame").\n'
+        )
+
     def _parse_json(self, text: str) -> Tuple[str, dict]:
         s = text.strip()
         s = s.replace("```json", "```").replace("```JSON", "```")
@@ -420,6 +523,47 @@ class OpenAIVLMAnnotator:
                 time.sleep(self.sleep_between_retries)
         raise RuntimeError(f"OpenAI call failed after {self.max_retries} retries: {last_err}") from last_err
 
+    def describe_out_of_frame(
+        self,
+        *,
+        pre_image: np.ndarray,
+        post_image: np.ndarray,
+        pre_mask_obj1: np.ndarray,
+        obj1_id: int,
+        start_frame: int,
+        end_frame: int,
+        image_detail: str = "low",
+    ) -> Tuple[str, dict]:
+        pre_vis = overlay_contours(pre_image, pre_mask_obj1)
+        post_vis = post_image.copy()
+
+        content = [
+            text_payload(self.user_prompt_out_of_frame(obj1_id, start_frame, end_frame)),
+            text_payload("Image 1 (pre-disappearance):"),
+            image_payload(pre_vis, detail=image_detail),
+            text_payload("Image 2 (post-disappearance):"),
+            image_payload(post_vis, detail=image_detail),
+        ]
+
+        last_err: Optional[Exception] = None
+        for _ in range(self.max_retries):
+            try:
+                rsp = self.client.chat.completions.create(
+                    model=self.model,
+                    temperature=self.temperature,
+                    messages=[
+                        {"role": "system", "content": self.system_prompt()},
+                        {"role": "user", "content": content},
+                    ],
+                )
+                text = rsp.choices[0].message.content
+                _, data = self._parse_json(text)
+                return text, data
+            except Exception as e:  # pragma: no cover
+                last_err = e
+                time.sleep(self.sleep_between_retries)
+        raise RuntimeError(f"OpenAI call failed after {self.max_retries} retries: {last_err}") from last_err
+
 
 # -----------------------------
 # Pipeline glue
@@ -431,6 +575,7 @@ class CutieStateChangePipeline:
         processor: Any,  # InferenceCore
         vlm: Optional[OpenAIVLMAnnotator] = None,
         occlusion: Optional[OcclusionDetector] = None,
+        offscreen: Optional[OffscreenDetector] = None,
         selector: Optional[InteractionCandidateSelector] = None,
         mask_saver: Optional[Any] = None,  # Cutie's ResultSaver
         save_mask_every: int = 1,
@@ -438,6 +583,9 @@ class CutieStateChangePipeline:
         self.processor = processor
         self.vlm = vlm
         self.occlusion = occlusion or OcclusionDetector()
+        self.offscreen = offscreen or OffscreenDetector(
+            min_area_px=self.occlusion.min_area_px,
+        )
         self.selector = selector or InteractionCandidateSelector()
 
         self.mask_saver = mask_saver
@@ -446,6 +594,7 @@ class CutieStateChangePipeline:
         self.images: List[np.ndarray] = []
         self.cls_masks: List[np.ndarray] = []
         self._occlusion_detectors: dict[int, OcclusionDetector] = {}
+        self._offscreen_detectors: dict[int, OffscreenDetector] = {}
 
     def _ensure_detector(self, obj_id: int) -> OcclusionDetector:
         if obj_id not in self._occlusion_detectors:
@@ -458,6 +607,17 @@ class CutieStateChangePipeline:
                 warmup_frames=self.occlusion.warmup_frames,
             )
         return self._occlusion_detectors[obj_id]
+
+    def _ensure_offscreen_detector(self, obj_id: int) -> OffscreenDetector:
+        if obj_id not in self._offscreen_detectors:
+            self._offscreen_detectors[obj_id] = OffscreenDetector(
+                min_area_px=self.offscreen.min_area_px,
+                border_margin_px=self.offscreen.border_margin_px,
+                decrease_window=self.offscreen.decrease_window,
+                disappear_patience=self.offscreen.disappear_patience,
+                min_border_hits=self.offscreen.min_border_hits,
+            )
+        return self._offscreen_detectors[obj_id]
 
     def _remap_tmp_to_obj(self, mask_tmp: np.ndarray) -> np.ndarray:
         om = getattr(self.processor, "object_manager", None)
@@ -507,19 +667,24 @@ class CutieStateChangePipeline:
         empty_mask = np.zeros_like(pred_cls_mask, dtype=np.uint8)
         for obj_id in sorted(all_ids):
             det = self._ensure_detector(obj_id)
+            off_det = self._ensure_offscreen_detector(obj_id)
             if obj_id in present_ids:
                 mask01 = bin_mask_from_id(pred_cls_mask, obj_id)
             else:
                 mask01 = empty_mask
             det.update(frame_idx, mask01, obj_id=obj_id)
+            off_det.update(frame_idx, mask01, obj_id=obj_id)
 
     def pop_state_changes(self, *, image_detail: str = "low") -> List[StateChange]:
         events: List[OcclusionEvent] = []
         for det in self._occlusion_detectors.values():
             events.extend(det.pop_events())
+        offscreen_events: List[OffscreenEvent] = []
+        for det in self._offscreen_detectors.values():
+            offscreen_events.extend(det.pop_events())
         out: List[StateChange] = []
 
-        if not events:
+        if not events and not offscreen_events:
             return out
 
         if self.vlm is None:
@@ -533,6 +698,17 @@ class CutieStateChangePipeline:
                     obj2="unknown object",
                     description="occluded",
                     meta={"note": "No VLM annotator configured."}
+                ))
+            for ev in offscreen_events:
+                out.append(StateChange(
+                    start_frame=ev.start_frame,
+                    end_frame=ev.end_frame,
+                    obj1_id=ev.obj_id,
+                    obj2_id=-1,
+                    obj1=f"object {ev.obj_id}",
+                    obj2="unknown object",
+                    description="left the frame",
+                    meta={"note": "No VLM annotator configured.", "event": ev.__dict__}
                 ))
             return out
 
@@ -620,6 +796,39 @@ class CutieStateChangePipeline:
                     description=str(desc).strip(),
                     meta={"vlm_raw": raw_text, "vlm_parsed": parsed, "event": ev.__dict__}
                 ))
+
+        for ev in offscreen_events:
+            if ev.pre_frame < 0 or ev.post_frame >= len(self.images):
+                continue
+
+            pre_img = self.images[ev.pre_frame]
+            post_img = self.images[ev.post_frame]
+            pre_cls = self.cls_masks[ev.pre_frame]
+            pre_m1 = bin_mask_from_id(pre_cls, ev.obj_id)
+
+            raw_text, parsed = self.vlm.describe_out_of_frame(
+                pre_image=pre_img,
+                post_image=post_img,
+                pre_mask_obj1=pre_m1,
+                obj1_id=ev.obj_id,
+                start_frame=ev.start_frame,
+                end_frame=ev.end_frame,
+                image_detail=image_detail,
+            )
+
+            desc = parsed.get("description", raw_text)
+            obj1_name = parsed.get("obj1_name") or parsed.get("object_1") or parsed.get("obj1")
+            obj1_name = str(obj1_name).strip() if obj1_name else f"object {ev.obj_id}"
+            out.append(StateChange(
+                start_frame=ev.start_frame,
+                end_frame=ev.end_frame,
+                obj1_id=ev.obj_id,
+                obj2_id=-1,
+                obj1=obj1_name,
+                obj2="unknown object",
+                description=str(desc).strip(),
+                meta={"vlm_raw": raw_text, "vlm_parsed": parsed, "event": ev.__dict__}
+            ))
 
         return out
 
