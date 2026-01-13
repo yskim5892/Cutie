@@ -25,6 +25,7 @@ import torch
 import cv2  # used for contours, video IO
 
 from PIL import Image
+from tqdm import tqdm
 
 
 # -----------------------------
@@ -595,6 +596,24 @@ class CutieStateChangePipeline:
         self.cls_masks: List[np.ndarray] = []
         self._occlusion_detectors: dict[int, OcclusionDetector] = {}
         self._offscreen_detectors: dict[int, OffscreenDetector] = {}
+        self.inference_seconds = 0.0
+        self.vlm_seconds = 0.0
+
+    def iter_with_progress(
+        self,
+        frame_iter: Iterable[Tuple[int, np.ndarray]],
+        *,
+        total: Optional[int] = None,
+        desc: str = "Cutie pipeline",
+    ):
+        return tqdm(frame_iter, total=total, desc=desc, unit="frame")
+
+    def _time_vlm_call(self, fn, *args, **kwargs):
+        start = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            self.vlm_seconds += time.perf_counter() - start
 
     def _ensure_detector(self, obj_id: int) -> OcclusionDetector:
         if obj_id not in self._occlusion_detectors:
@@ -640,10 +659,12 @@ class CutieStateChangePipeline:
     ) -> None:
         self.images.append(frame_rgb.astype(np.uint8))
 
+        start = time.perf_counter()
         if init_mask_tensor is not None:
             output_prob = self.processor.step(image_tensor, init_mask_tensor, objects=init_objects)
         else:
             output_prob = self.processor.step(image_tensor)
+        self.inference_seconds += time.perf_counter() - start
 
         # Save masks via ResultSaver (same as process_video.py)
         if self.mask_saver is not None and (frame_idx % max(self.save_mask_every, 1) == 0):
@@ -737,7 +758,8 @@ class CutieStateChangePipeline:
                 candidates = occluder_ids[: self.selector.top_k]
 
             if not candidates:
-                raw_text, parsed = self.vlm.describe_occlusion(
+                raw_text, parsed = self._time_vlm_call(
+                    self.vlm.describe_occlusion,
                     pre_image=pre_img,
                     post_image=post_img,
                     pre_mask_obj1=pre_m1,
@@ -767,7 +789,8 @@ class CutieStateChangePipeline:
                 pre_m2 = bin_mask_from_id(pre_cls, obj2)
                 post_m2 = bin_mask_from_id(post_cls, obj2)
 
-                raw_text, parsed = self.vlm.describe_interaction(
+                raw_text, parsed = self._time_vlm_call(
+                    self.vlm.describe_interaction,
                     pre_image=pre_img,
                     post_image=post_img,
                     pre_mask_obj1=pre_m1,
@@ -806,7 +829,8 @@ class CutieStateChangePipeline:
             pre_cls = self.cls_masks[ev.pre_frame]
             pre_m1 = bin_mask_from_id(pre_cls, ev.obj_id)
 
-            raw_text, parsed = self.vlm.describe_out_of_frame(
+            raw_text, parsed = self._time_vlm_call(
+                self.vlm.describe_out_of_frame,
                 pre_image=pre_img,
                 post_image=post_img,
                 pre_mask_obj1=pre_m1,
