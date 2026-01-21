@@ -90,7 +90,12 @@ def main():
     init_mask_tensor = torch.from_numpy(mask_np).to(args.device)
 
     # VLM annotator
-    vlm = OpenAIVLMAnnotator(model=args.model, temperature=args.temperature)
+    vlm_output_dir = os.path.dirname(args.output_video_path)
+    vlm = OpenAIVLMAnnotator(
+        model=args.model,
+        temperature=args.temperature,
+        output_dir=vlm_output_dir,
+    )
 
     # ResultSaver (same pattern as process_video.py)
     mask_saver = None
