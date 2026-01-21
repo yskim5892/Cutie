@@ -808,6 +808,7 @@ class CutieStateChangePipeline:
         *,
         init_mask_tensor=None,  # torch HxW long
         init_objects: Optional[List[int]] = None,
+        force_permanent=False
     ) -> None:
         if init_objects is not None and self.tracked_obj_ids is None:
             self.tracked_obj_ids = set(int(x) for x in init_objects)
@@ -815,9 +816,9 @@ class CutieStateChangePipeline:
 
         start = time.perf_counter()
         if init_mask_tensor is not None:
-            output_prob = self.processor.step(image_tensor, init_mask_tensor, objects=init_objects)
+            output_prob = self.processor.step(image_tensor, init_mask_tensor, objects=init_objects, force_permanent=force_permanent)
         else:
-            output_prob = self.processor.step(image_tensor)
+            output_prob = self.processor.step(image_tensor, force_permanent=force_permanent)
         self.inference_seconds += time.perf_counter() - start
 
         # Save masks via ResultSaver (same as process_video.py)

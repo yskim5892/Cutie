@@ -41,6 +41,7 @@ def main():
     parser.add_argument("--model", type=str, default="gpt-5.2", help="OpenAI VLM model name.")
     parser.add_argument("--temperature", type=float, default=0.0, help="VLM temperature (gpt-5.2 supports this).")
     parser.add_argument("--max_internal_size", type=int, default=480, help="Cutie internal resize; -1 keeps original.")
+    parser.add_argument("--force_permanent", action="store_true")
     parser.add_argument("--output_fps", type=float, default=30.0, help="FPS for output mask video.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -139,9 +140,9 @@ def main():
         img_tensor = to_tensor(frame_rgb).to(args.device).float()
 
         if ti == 0:
-            pipe.feed_frame(ti, frame_rgb, img_tensor, init_mask_tensor=init_mask_tensor, init_objects=objects)
+            pipe.feed_frame(ti, frame_rgb, img_tensor, init_mask_tensor=init_mask_tensor, init_objects=objects, force_permanent=args.force_permanent)
         else:
-            pipe.feed_frame(ti, frame_rgb, img_tensor)
+            pipe.feed_frame(ti, frame_rgb, img_tensor, force_permanent=args.force_permanent)
 
         all_sc.extend(pipe.pop_state_changes(image_detail="low"))
 
